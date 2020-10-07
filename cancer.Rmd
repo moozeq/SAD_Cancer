@@ -1,0 +1,434 @@
+---
+title: "ML cancer"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+knitr::opts_chunk$set(fig.width=12, fig.height=8) 
+library(ggplot2)
+library(reshape2)
+library(caret)
+library(corrplot)
+library(RColorBrewer)
+library(data.table)
+library(gridExtra)
+library(randomForest)
+library(png)
+load("cancer.RData")
+```
+
+## 1
+
+### a) Var types
+
+```{r}
+var_types <- sapply(data.train, class)
+print(var_types[!duplicated(var_types)])
+```
+
+```
+ENSG00000000003 
+      "numeric"
+```
+
+### b) Correlation 500 most variability genes
+
+```{r}
+vars <- sapply(within(data.train, rm(Y)), var)
+vars_df <- data.frame(vars)
+vars_test <- sapply(data.test, var)
+vars_test_df <- data.frame(vars_test)
+vars500 <- sort(vars, decreasing = TRUE)[1:500]
+vars500_data <- data.train[,names(vars500)]
+vars500_data_all <- vars500_data
+vars500_data_all$Y <- data.train$Y
+cors500 <- cor(vars500_data)
+cors500[lower.tri(cors500, diag = TRUE)] <- NA
+melted_cors500 <- melt(cors500)
+cors500_final <- na.omit(melted_cors500)
+```
+
+```{r, echo=FALSE}
+ggplot(cors500_final, aes(x=value, y="")) + geom_violin() + ylab("") + xlab("Correlation") + ggtitle("Correlations distribution for 500 most varianced genes")
+```
+
+```{r, echo=FALSE, eval=TRUE, fig.height=8, fig.width=12, fig.align="center"}
+pp1 <- readPNG("zad1.png")
+plot(NA, xlim = c(0, 1), ylim = c(0, 1), type = "n", xaxt = "n", yaxt = "n", xlab = "", ylab = "")
+rasterImage(pp1,0,0,1,1)
+```
+
+## 3
+
+Histograms:
+
+```{r, echo=FALSE}
+ggplot(vars_df, aes(vars)) + geom_histogram(binwidth = 0.1, colour = "black")
+ggplot(vars_test_df, aes(vars_test)) + geom_histogram(binwidth = 0.1, colour = "black")
+```
+
+
+```{r, echo=FALSE, eval=TRUE, fig.height=8, fig.width=12, fig.align="center"}
+pp1 <- readPNG("zad2_1.png")
+plot(NA, xlim = c(0, 1), ylim = c(0, 1), type = "n", xaxt = "n", yaxt = "n", xlab = "", ylab = "")
+rasterImage(pp1,0,0,1,1)
+```
+
+```{r, echo=FALSE, eval=TRUE, fig.height=8, fig.width=12, fig.align="center"}
+pp1 <- readPNG("zad2_2.png")
+plot(NA, xlim = c(0, 1), ylim = c(0, 1), type = "n", xaxt = "n", yaxt = "n", xlab = "", ylab = "")
+rasterImage(pp1,0,0,1,1)
+```
+
+ANOVA selection:
+
+```{r}
+anova_threshold <- 0.001
+data_to_train <- data.train
+l <- vector("list", ncol(data_to_train) - 1)
+j <- 1
+for (i in 1:(ncol(data_to_train) - 1)) {
+  gene <- names(data_to_train[i])
+  anovaresult <- anova(aov(data_to_train[,i] ~ Y,data=data_to_train))
+  if(anovaresult$Pr[1] < anova_threshold) {
+    p <- anovaresult$Pr[1]
+    l[[j]] <- gene
+    j <- j + 1
+  }
+}
+
+an_name <- paste("anova_threshold_", anova_threshold, sep = "")
+an_name <- sub("-", "", an_name)
+assign(an_name, l[lengths(l) != 0])
+
+nl <- eval(parse(text = an_name))
+print(paste("ANOVA genes count: ", length(nl), sep=""))
+
+genes_after_anova <- unlist(nl, use.names = FALSE)
+genes_after_anova_with_Y <- append(genes_after_anova, 'Y')
+data_after_anova <- data.train[,genes_after_anova_with_Y]
+data_after_anova_raw <- data.train[,genes_after_anova]
+
+cdata <- data_after_anova #  data_after_corr
+cory <- abs(cor(cdata))
+
+cory_y <- data.frame(cory[,"Y"])
+names(cory_y)[1] <- "y_cor"
+melt(setDT(cory_y, keep.rownames = TRUE))
+```
+```
+[1] "ANOVA genes count: 7253"
+```
+
+Correlation selection:
+
+```{r}
+find_best <- function(corr_threshold, btw_corr_threshold, mode, data_train, data_test) {
+  res <- list()
+  
+  res$corr_threshold = corr_threshold
+  res$btw_corr_threshold = btw_corr_threshold
+  
+  if (corr_threshold >= 0) {
+    # Y correlation
+    cory_y_sel <- cory_y[cory_y$y_cor > corr_threshold & cory_y$y_cor != 1.0,]
+    cor_y_names <- as.vector(cory_y_sel[,1]$rn)
+    data_after_corr_y <- cdata[,cor_y_names]
+  } else { # skip if -1
+    data_after_corr_y <- cdata
+  }
+  
+  if (btw_corr_threshold >= 0) {
+    # between correlation
+    cdata <- data_after_corr_y# data_after_anova_raw
+    hc = findCorrelation(cor(cdata), cutoff = btw_corr_threshold)
+    hc = sort(hc)
+    data_after_corr <- cdata[,-c(hc)]
+    data_after_corr$Y <- data.train$Y
+  } else { # skip if -1
+    data_after_corr <- cdata
+    data_after_corr$Y <- data.train$Y
+  }
+  
+  cdata <- data_after_corr  # data_after_corr_y
+  cgenes <- paste(unlist(colnames(cdata)[1:ncol(cdata) - 1]), collapse=' + ')
+  
+  trnCtrl <- trainControl(method = "repeatedcv", number = 10, repeats = 3)
+  #trnCtrl <- trainControl(method = "cv", number = 10)
+  
+  if (mode == "glmnet") {
+    srchGrd <- expand.grid(alpha = seq(0, 1, length = 10), lambda = seq(0.0001, 1, length = 100))
+    mod_train <- paste("my.train5 <- train(Y ~", cgenes, ", data = data_train, method = \"glmnet\", tuneGrid = srchGrd, trControl = trnCtrl, standardize = TRUE, maxit = 10000)")
+  }
+  else if (mode == "rf") {
+    rfGrd <- expand.grid(.mtry=c(sqrt(ncol(cdata))))
+    mod_train <- paste("my.train5 <- train(Y ~", cgenes, ", data = data_train, method = \"rf\", tuneGrid = rfGrd, trControl = trnCtrl, standardize = TRUE, maxit = 10000)")
+  }
+  else {
+    return(res)
+  }
+  
+  eval(parse(text = mod_train))
+  
+  res$model = my.train5
+  res$mod_train = mod_train
+  
+  # cross validated train RMSE
+  if (mode == "glmnet") {
+    res$train_err = my.train5$model$results$RMSE[which.min(my.train5$model$results$RMSE)]
+  }
+  else if (mode == "rf") {
+    res$train_err = my.train5$model$results$RMSE
+  }
+  
+  # test RMSE
+  preds_en5_test <- predict(my.train5, newdata = data_test)
+  res$test_err = postResample(preds_en5_test, data_test$Y)
+  
+  res
+}
+```
+
+```{r}
+find_best_btw_corr <- function(min_y_corr, btw_corr_threshold, mode, final_data) {
+  if (final_data == TRUE) { # final data to train on
+    a_train = data.train
+    a_test = data.train
+  }
+  else { # splitted training data to find out best model
+    a_train <- data.train[100:644,]
+    a_test <- data.train[1:100,]
+  }
+  set.seed(2137)
+  
+  results = list()
+  j = 1
+  if (min_y_corr >= 0) {
+    for (i in seq(0.5, min_y_corr, length.out = 11)) {
+      res <-find_best(i, btw_corr_threshold, mode, a_train, a_test)
+      results[[j]] = res
+      j = j + 1
+      print(res$corr_threshold)
+      print(length(res$model$coefnames))
+      print(res$train_err)
+      print(res$test_err)
+    }
+  }
+  else { # when min y corr is <0 than skip selecting based on it
+    res <-find_best(-1, btw_corr_threshold, mode, a_train, a_test)
+    results[[j]] = res
+    print(res$corr_threshold)
+    print(length(res$model$coefnames))
+    print(res$train_err)
+    print(res$test_err)
+  }
+  results
+}
+```
+
+Results:
+
+```{r}
+show_model_results_plot <- function(results, title, filename) {
+  datalist = list()
+  j = 1
+  for (res in results) {
+    datalist[[j]] = data.frame(corr_y=res$corr_threshold, test_rmse=res$test_err[1], train_rmse=res$train_err, num=length(res$model$coefnames))
+    j = j + 1
+  }
+  df = do.call(rbind, datalist)
+  rownames(df) <- NULL
+  
+  p1 = ggplot(df, aes(x=corr_y)) + geom_line(aes(y=test_rmse), color='red') + geom_line(aes(y=train_rmse), color='blue') + labs(y = 'RMSE', x = 'Y correlation') + ylim(0.1, 0.14) + ggtitle(title)
+  p2 = ggplot(df, aes(x=num)) + geom_line(aes(y=test_rmse), color='red') + geom_line(aes(y=train_rmse), color='blue') + labs(y = 'RMSE', x = 'Number of genes') + ylim(0.1, 0.14) + xlim(0, 7253) + ggtitle(title)
+  plts = grid.arrange(p1, p2, nrow = 2)
+  ggsave(filename, plot=plts)
+}
+```
+
+1. ANOVA selection (based on p-value threshold)
+2. Select variables most correlated with 'Y' (based on Y-corr threshold)
+3. Removing most cross-correlated variables (based on cross-corr threshold)
+
+## 4
+
+Building models:
+
+```{r}
+res_glmnet_065 = find_best_btw_corr(0.1, 0.65, "glmnet", FALSE)
+results_glmnet_090 = find_best_btw_corr(0.1, 0.9, "glmnet", FALSE)
+res_rf_065 = find_best_btw_corr(0.1, 0.65, "rf", FALSE)
+results_rf_090 = find_best_btw_corr(0.1, 0.9, "rf", FALSE)
+```
+
+Models need to be saved and read after built, due to memory limits:
+
+```{r, echo=FALSE}
+res_glmnet_065 = readRDS("res_glmnet_065.rds")
+res_glmnet_090 = readRDS("res_glmnet_090.rds")
+res_rf_065 = readRDS("res_rf_065.rds")
+res_rf_090 = readRDS("res_rf_090.rds")
+```
+
+Results:
+
+```{r, echo=FALSE}
+show_model_results_plot(res_glmnet_065, "Elastic net, cutoff correlation between = 0.65", "glmnet_065.png")
+show_model_results_plot(res_glmnet_090, "Elastic net, cutoff correlation between = 0.90", "glmnet_090.png")
+show_model_results_plot(res_rf_065, "Random forest, cutoff correlation between = 0.65", "rf_065.png")
+show_model_results_plot(res_rf_090, "Random forest, cutoff correlation between = 0.90", "rf_090.png")
+```
+
+```{r, echo=FALSE, eval=TRUE, fig.height=8, fig.width=12, fig.align="center"}
+pp1 <- readPNG("glmnet_065.png")
+pp2 <- readPNG("glmnet_090.png")
+pp3 <- readPNG("rf_065.png")
+pp4 <- readPNG("rf_090.png")
+plot(NA, xlim = c(0, 2), ylim = c(0, 2), type = "n", xaxt = "n", yaxt = "n", xlab = "", ylab = "")
+rasterImage(pp1,0,0,1,1)
+rasterImage(pp2,0,1,1,2)
+rasterImage(pp3,1,0,2,1)
+rasterImage(pp4,1,1,2,2)
+```
+
+Best model is Random Forest with Y-correlation threshold = 0.46 and cross-correlation threshold = 0.9 on data with ANOVA p-value threshold = 0.001
+
+-------
+
+Models without any selection:
+
+```{r}
+res_glmnet_000 = find_best_btw_corr(-1, -1, "glmnet", FALSE)
+res_rf_000 = find_best_btw_corr(-1, -1, "rf", FALSE)
+```
+
+
+```{r, echo=FALSE}
+print(paste("elastic net (pure) RMSE: ", res_glmnet_000[[1]]$train_err[[1]], "; random forest (corr_y = 0.46, corr_between = 0.9) RMSE: ", res_rf_090[[2]]$train_err[[1]]))
+```
+
+```
+elastic net   (pure)                              RMSE:  0.102322042198110
+random forest (corr_y = 0.46, corr_between = 0.9) RMSE:  0.106720089796651
+```
+
+```{r, echo=FALSE}
+print(paste("elastic net (pure) RMSE: ", res_glmnet_000[[1]]$test_err[[1]], "; random forest (corr_y = 0.46, corr_between = 0.9) RMSE: ", res_rf_090[[2]]$test_err[[1]]))
+```
+
+```
+elastic net   (pure)                              RMSE:  0.132425543474816
+random forest (corr_y = 0.46, corr_between = 0.9) RMSE:  0.121851519350148
+```
+
+Best Elastic Net models has also Y-correlation threshold = 0.46 and cross-correlation threshold = 0.9 on data with ANOVA p-value threshold = 0.001
+
+```{r, echo=FALSE}
+print(paste("elastic net (corr_y = 0.46, corr_between = 0.9) RMSE: ", res_glmnet_090[[2]]$train_err[[1]], "; random forest (corr_y = 0.46, corr_between = 0.9) RMSE: ", res_rf_090[[2]]$train_err[[1]]))
+```
+
+```
+elastic net   (corr_y = 0.46, corr_between = 0.9) RMSE:  0.105508153223289
+random forest (corr_y = 0.46, corr_between = 0.9) RMSE:  0.106720089796651
+```
+
+```{r, echo=FALSE}
+print(paste("elastic net (corr_y = 0.46, corr_between = 0.9) RMSE: ", res_glmnet_090[[2]]$test_err[[1]], "; random forest (corr_y = 0.46, corr_between = 0.9) RMSE: ", res_rf_090[[2]]$test_err[[1]]))
+```
+
+```
+elastic net   (corr_y = 0.46, corr_between = 0.9) RMSE:  0.123187638354296
+random forest (corr_y = 0.46, corr_between = 0.9) RMSE:  0.121851519350148
+```
+
+Random Forest without any selections:
+
+```{r, echo=FALSE}
+print(paste("random forest (pure) RMSE: ", res_rf_000[[1]]$train_err[[1]], "; random forest (corr_y = 0.46, corr_between = 0.9) RMSE: ", res_rf_090[[2]]$train_err[[1]]))
+```
+
+```
+random forest (pure)                              RMSE:  0.104863668843563
+random forest (corr_y = 0.46, corr_between = 0.9) RMSE:  0.106720089796651
+```
+
+```{r, echo=FALSE}
+print(paste("random forest (pure) RMSE: ", res_rf_000[[1]]$test_err[[1]], "; random forest (corr_y = 0.46, corr_between = 0.9) RMSE: ", res_rf_090[[2]]$test_err[[1]]))
+```
+
+```
+random forest (pure)                              RMSE:  0.124790824997018
+random forest (corr_y = 0.46, corr_between = 0.9) RMSE:  0.121851519350148
+```
+
+Final results:
+
+```
+Method                                                  RMSE train          RMSE test
+---------------------------------------------------------------------------------------------
+elastic net (pure):                                     0.102322042198110   0.132425543474816
+elastic net (corr_y = 0.46, corr_between = 0.9):        0.105508153223289   0.123187638354296
+random forest (pure):                                   0.104863668843563   0.124790824997018
+random forest (corr_y = 0.46, corr_between = 0.9):      0.106720089796651   0.121851519350148
+```
+
+## 5
+
+Selected genes for best model (Random Forest Y-corr = 0.46; cross-corr = 0.9)
+
+```
+ [1] "ENSG00000006327" "ENSG00000007968" "ENSG00000061676" "ENSG00000068831" "ENSG00000072682" "ENSG00000075884" "ENSG00000082781"
+ [8] "ENSG00000085733" "ENSG00000089094" "ENSG00000089876" "ENSG00000100196" "ENSG00000102879" "ENSG00000104067" "ENSG00000105122"
+[15] "ENSG00000107099" "ENSG00000118308" "ENSG00000118513" "ENSG00000122122" "ENSG00000123338" "ENSG00000124145" "ENSG00000125354"
+[22] "ENSG00000130755" "ENSG00000130958" "ENSG00000134516" "ENSG00000136830" "ENSG00000137693" "ENSG00000138119" "ENSG00000143851"
+[29] "ENSG00000160633" "ENSG00000160789" "ENSG00000162909" "ENSG00000167984" "ENSG00000168421" "ENSG00000168938" "ENSG00000172380"
+[36] "ENSG00000180448" "ENSG00000181019" "ENSG00000182162" "ENSG00000186517" "ENSG00000189171" "ENSG00000196247" "ENSG00000198771"
+[43] "ENSG00000205730"
+```
+
+Building final model with cross-validation, tuning ntree:
+
+```{r}
+res_rf_090 = readRDS("res_rf_090.rds")
+genes = res_rf_090[[2]][["model"]][["coefnames"]]
+whole_data_train = data.train[,genes]
+whole_data_train$Y = data.train$Y
+
+trnCtrl <- trainControl(method = "cv", number = 10)
+rfGrd <- expand.grid(.mtry=c(sqrt(ncol(cdata))))
+
+modellist <- list()
+for (ntree in c(1000,1500,2000,2500)){
+  set.seed(2137)
+  final_model = train(Y ~ ., data = whole_data_train, method = "rf", tuneGrid = rfGrd, trControl = trnCtrl, standardize = TRUE, maxit = 10000)
+  modellist[[toString(ntree)]] = final_model
+  print(final_model)
+}
+
+
+print(final_model)
+```
+```
+Random Forest 
+
+644 samples
+ 43 predictor
+
+No pre-processing
+Resampling: Cross-Validated (10 fold, repeated 5 times) 
+Summary of sample sizes: 580, 580, 580, 580, 580, 580, ... 
+Resampling results:
+
+  RMSE       Rsquared  MAE       
+  0.1088438  0.383584  0.08162398
+
+Tuning parameter 'mtry' was held constant at a value of 6.63325
+```
+
+Prediction:
+
+```{r}
+pred <- predict(final_model, newdata = data.test)
+save(pred, file="pred_results.RData")
+```
